@@ -1,5 +1,4 @@
 #include "syscalls.h"
-#define SYSCALL_REGISTER_TIMER 1
 
 void register_timer_function(void (*callback_func)()) {
     // We will pass:

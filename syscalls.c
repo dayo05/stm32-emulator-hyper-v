@@ -6,11 +6,16 @@ void register_timer_interrupt_syscall(registers_t* regs) {
     register_timer_handler((void(*)(void))(regs->ebx));
 }
 
-syscall_handler_function syscalls[] = {register_timer_interrupt_syscall};
+void print_hex_syscall(registers_t* regs) {
+    print_hex((uint32) regs->ebx);
+}
+
+void print_syscall(registers_t* regs) {
+    print((char*) regs->ebx);
+}
+
+syscall_handler_function syscalls[] = {register_timer_interrupt_syscall, print_hex_syscall, print_syscall};
 
 void syscall_handler(registers_t *regs) {
-    print("SYSCALL with ");
-    print_hex(regs->eax);
-    print("Recved");
     syscalls[regs->eax - 1](regs);
 }
