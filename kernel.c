@@ -4,11 +4,13 @@
 #include "print.h"
 #include "hook.h"
 #include "ata.h"
+#include "ports.h"
 
-// --- EXTERN DECLARATIONS ---
 // These functions are defined in interrupts.asm
 extern void isr1_wrapper(void);
 extern void isr14_wrapper(void);
+extern void isr80(void);
+extern void isr_timer_wrapper(void);
 extern void load_idt(void* base, unsigned short size);
 
 uint32 page_directory[1024] __attribute__((aligned(4096)));
@@ -17,6 +19,10 @@ uint32 first_page_table[1024] __attribute__((aligned(4096)));
 // The actual table (256 entries)
 struct IDTEntry idt[256];
 
+// --- TIMER & CALLBACK VARIABLES ---
+TimerCallback user_timer_callback = 0;
+uint32 tick_counter = 0;
+
 // --- FUNCTION DEFINITION ---
 void setup_idt_entry(int n, unsigned int handler) {
     idt[n].offset_low = handler & 0xFFFF;       // Lower 16 bits of address
@@ -24,6 +30,65 @@ void setup_idt_entry(int n, unsigned int handler) {
     idt[n].zero = 0;                            // Always zero
     idt[n].type_attr = 0x8E;                    // 10001110b (Present, Ring 0, 32-bit Interrupt Gate)
     idt[n].offset_high = (handler >> 16) & 0xFFFF; // Upper 16 bits of address
+}
+
+void remap_pic() {
+    uint8 a1, a2;
+
+    a1 = inb(0x21); // Save masks
+    a2 = inb(0xA1);
+
+    outb(0x20, 0x11); io_wait(); // Start init sequence (ICW1)
+    outb(0xA0, 0x11); io_wait();
+
+    outb(0x21, 0x20); io_wait(); // ICW2: Master Offset (0x20)
+    outb(0xA1, 0x28); io_wait(); // ICW2: Slave Offset (0x28)
+
+    outb(0x21, 0x04); io_wait(); // ICW3: Tell Master about Slave
+    outb(0xA1, 0x02); io_wait(); // ICW3: Tell Slave its identity
+
+    outb(0x21, 0x01); io_wait(); // ICW4: 8086 mode
+    outb(0xA1, 0x01); io_wait();
+
+    outb(0x21, a1);   // Restore masks
+    outb(0xA1, a2);
+}
+
+// 2. Initialize PIT for 50us (20kHz)
+// Base Frequency: 1193182 Hz
+// Divisor = 1193182 / 20000 = ~59
+void init_pit_50us() {
+    uint32 frequency = 20000;
+    uint32 divisor = 1193180 / frequency;
+
+    // Command: Channel 0, Access lo/hi byte, Square Wave, 16-bit binary
+    outb(0x43, 0x36);
+
+    // Split divisor into bytes
+    uint8 l = (uint8)(divisor & 0xFF);
+    uint8 h = (uint8)( (divisor>>8) & 0xFF );
+
+    // Send Frequency
+    outb(0x40, l);
+    outb(0x40, h);
+}
+
+// --- HANDLERS ---
+
+// This function is called by user applications to register their handler
+void register_timer_handler(TimerCallback cb) {
+    user_timer_callback = cb;
+    print("Timer Handler Registered!\n");
+}
+
+// This is called by the ASM wrapper (isr_timer_wrapper)
+void timer_handler() {
+    tick_counter++;
+
+    // Execute user callback if it exists
+    if (user_timer_callback) {
+        user_timer_callback();
+    }
 }
 
 // --- HOOK MANAGER ---
@@ -216,21 +281,38 @@ int secret_vault_device(uint32 address, void* page_ptr, int is_write) {
 }
 
 void kern_main() {
-    // while(true);
-    print("Before idt");
+    print("Loading IDT");
     // 1. Setup IDT
     setup_idt_entry(1, (uint32)isr1_wrapper);  // Debug
     setup_idt_entry(14, (uint32)isr14_wrapper); // Page Fault
+    remap_pic();
+    setup_idt_entry(32, (uint32)isr_timer_wrapper);
+    setup_idt_entry(0x80, (uint32)isr80);
     load_idt(idt, sizeof(idt) - 1);
 
+    // Disable IRQ14
+    uint8 mask = inb(0xA1);
+    mask |= (1 << 6); // Set bit 6
+    outb(0xA1, mask);
+
+    // Unmask Timer IRQ0
+    outb(0x21, inb(0x21) & 0xFE);
+
+    // 3. Configure 50us Timer
+    init_pit_50us();
+
+    // 4. Unmask IRQ0 (Timer) on PIC
+    // 0xFE = 1111 1110 (Enable Bit 0 only)
+    outb(0x21, inb(0x21) & 0xFE);
+
     // 2. Setup Paging & Hooks
-    init_paging();
 
     char* fs_base = (char*) 0x200000;
     // NOTE: ATA LBA 17 is exactly where we put the FS in build_fs.py
     print("Loading Filesystem...");
     ata_read_sectors(64, 2500, fs_base);
     print("Done.\n");
+    init_paging();
 
     // 3. Parse Filesystem (Logic mostly same, just pointers changed)
     if (fs_base[0] != 'F' || fs_base[1] != 'S') {
@@ -238,25 +320,28 @@ void kern_main() {
         while(1);
     }
 
+
     uint16 file_count = *(uint16*)(fs_base + 2);
     char* headers_start = fs_base + 4;
     char* data_start = headers_start + (file_count * sizeof(struct FileHeader));
     struct FileHeader* current_file = (struct FileHeader*) headers_start;
 
 
-    register_hook(0x100000, secret_vault_device);
+    register_hook(0x1F0000, secret_vault_device);
 
+    // 5. ENABLE INTERRUPTS (Cpu-wide)
+    asm volatile("sti");
     for (int i = 0; i < file_count; i++) {
         if (strcmp(current_file->name, "app.bin") == 0) {
 
             // 4. Relocate User App to 0x300000 (3MB Mark)
             // Giving it 1MB of dedicated space (from 3MB to 4MB)
             char* file_content = data_start + current_file->offset;
-            char* execution_location = (char*)0x200000;
+            char* execution_location = (char*)0x20000;
 
             memcpy(execution_location, file_content, current_file->size);
 
-            print("Running App at 0x200000...\n");
+            print("Running App at 0x20000...\n");
 
             // 5. Execute
             FunctionPtr app_entry = (FunctionPtr)execution_location;
@@ -266,5 +351,7 @@ void kern_main() {
         current_file++;
     }
 
-    while(1);
+    print("HLT");
+    while(1)
+        asm volatile("hlt");
 }

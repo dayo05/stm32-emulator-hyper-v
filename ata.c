@@ -9,13 +9,21 @@ void ata_wait_bsy() {
 void ata_wait_drq() {
     while(!(inb(ATA_PRIMARY_COMMAND) & ATA_STATUS_DRQ));
 }
-// ata.c
+
+void ata_io_wait() {
+    // Reading the status register 4 times takes approx 400ns
+    inb(ATA_PRIMARY_COMMAND);
+    inb(ATA_PRIMARY_COMMAND);
+    inb(ATA_PRIMARY_COMMAND);
+    inb(ATA_PRIMARY_COMMAND);
+}
 
 // Internal function to read a SINGLE batch (max 255 sectors)
 void ata_read_batch(uint32 lba, uint8 count, uint16* buffer) {
     ata_wait_bsy();
 
     outb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
+    ata_io_wait();
     outb(ATA_PRIMARY_SEC_COUNT, count);
     outb(ATA_PRIMARY_LBA_LO, (uint8)lba);
     outb(ATA_PRIMARY_LBA_MID, (uint8)(lba >> 8));

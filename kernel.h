@@ -31,4 +31,8 @@ struct IDTEntry {
     unsigned short offset_high;
 } __attribute__((packed));
 
+
+typedef void (*TimerCallback)(void);
+void register_timer_handler(TimerCallback cb);
+
 #endif
