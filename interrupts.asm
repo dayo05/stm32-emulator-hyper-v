@@ -6,9 +6,11 @@ section .text
 [extern debug_handler]
 [extern timer_handler]
 [extern syscall_handler]
+[extern keyboard_handler]
 global isr1_wrapper
 global isr14_wrapper
 global isr_timer_wrapper
+global isr_keyboard_wrapper
 global isr80
 global load_idt
 
@@ -60,6 +62,17 @@ isr_timer_wrapper:
 
     popad               ; Restore registers
     iretd               ; Return from Interrupt
+
+isr_keyboard_wrapper:
+    pushad
+    cld
+    
+    call keyboard_handler
+
+    mov al, 0x20
+    out 0x20, al
+    popad
+    iretd
 
 isr80:
     cli             ; Disable interrupts

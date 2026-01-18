@@ -18,6 +18,10 @@ static inline void insw(uint16 port, void* addr, int count) {
     asm volatile("rep insw" : "+D"(addr), "+c"(count) : "d"(port) : "memory");
 }
 
+static inline void outw(uint16 port, uint16 val) {
+    asm volatile ( "outw %0, %1" : : "a"(val), "Nd"(port) );
+}
+
 static inline void io_wait(void) {
     outb(0x80, 0); // Write to unused port to wait a few cycles
 }

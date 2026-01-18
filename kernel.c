@@ -5,12 +5,14 @@
 #include "hook.h"
 #include "ata.h"
 #include "ports.h"
+#include "acpi.h"
 
 // These functions are defined in interrupts.asm
 extern void isr1_wrapper(void);
 extern void isr14_wrapper(void);
 extern void isr80(void);
 extern void isr_timer_wrapper(void);
+extern void isr_keyboard_wrapper(void);
 extern void load_idt(void* base, unsigned short size);
 
 uint32 page_directory[1024] __attribute__((aligned(4096)));
@@ -19,11 +21,9 @@ uint32 first_page_table[1024] __attribute__((aligned(4096)));
 // The actual table (256 entries)
 struct IDTEntry idt[256];
 
-// --- TIMER & CALLBACK VARIABLES ---
 TimerCallback user_timer_callback = 0;
 uint32 tick_counter = 0;
 
-// --- FUNCTION DEFINITION ---
 void setup_idt_entry(int n, unsigned int handler) {
     idt[n].offset_low = handler & 0xFFFF;       // Lower 16 bits of address
     idt[n].selector = 0x08;                     // Kernel Code Segment (Offset in GDT)
@@ -73,25 +73,27 @@ void init_pit_50us() {
     outb(0x40, h);
 }
 
-// --- HANDLERS ---
-
-// This function is called by user applications to register their handler
+// This is executed by system call
 void register_timer_handler(TimerCallback cb) {
     user_timer_callback = cb;
     print("Timer Handler Registered!\n");
 }
 
-// This is called by the ASM wrapper (isr_timer_wrapper)
 void timer_handler() {
     tick_counter++;
-
-    // Execute user callback if it exists
-    if (user_timer_callback) {
+    if (user_timer_callback) 
         user_timer_callback();
-    }
 }
 
-// --- HOOK MANAGER ---
+void keyboard_handler() {
+    uint8 scancode = inb(0x60); // Read from PS/2 Data Port
+    print("Key Pressed: ");
+    print_hex(scancode);
+    print("\n");
+    if (scancode == 0x1E)
+        acpi_shutdown();
+}
+
 struct HookEntry hooks[MAX_HOOKS];
 struct HookEntry* active_write_hook = 0; // Remembers which hook triggered the Trap
 
@@ -124,8 +126,6 @@ struct HookEntry* find_hook(uint32 address) {
     }
     return 0;
 }
-
-// --- HANDLERS ---
 
 void debug_handler(struct TrapFrame* tf) {
     // This runs AFTER the instruction executed (Single Step)
@@ -238,7 +238,6 @@ void init_paging() {
     asm volatile("mov %0, %%cr0" :: "r"(cr0));
 }
 
-// Helper: String Compare
 int strcmp(const char* s1, const char* s2) {
     while(*s1 && (*s1 == *s2)) {
         s1++; s2++;
@@ -246,7 +245,6 @@ int strcmp(const char* s1, const char* s2) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
-// Helper: Memory Copy
 void memcpy(char* dest, char* src, int count) {
     for (int i=0; i<count; i++) dest[i] = src[i];
 }
@@ -282,11 +280,11 @@ int secret_vault_device(uint32 address, void* page_ptr, int is_write) {
 
 void kern_main() {
     print("Loading IDT");
-    // 1. Setup IDT
     setup_idt_entry(1, (uint32)isr1_wrapper);  // Debug
     setup_idt_entry(14, (uint32)isr14_wrapper); // Page Fault
     remap_pic();
     setup_idt_entry(32, (uint32)isr_timer_wrapper);
+    setup_idt_entry(33, (uint32)isr_keyboard_wrapper);
     setup_idt_entry(0x80, (uint32)isr80);
     load_idt(idt, sizeof(idt) - 1);
 
@@ -298,14 +296,13 @@ void kern_main() {
     // Unmask Timer IRQ0
     outb(0x21, inb(0x21) & 0xFE);
 
-    // 3. Configure 50us Timer
+    // Configure 50us Timer
     init_pit_50us();
 
-    // 4. Unmask IRQ0 (Timer) on PIC
-    // 0xFE = 1111 1110 (Enable Bit 0 only)
+    // Unmask IRQ0 (Timer) on PIC
     outb(0x21, inb(0x21) & 0xFE);
 
-    // 2. Setup Paging & Hooks
+    init_acpi();
 
     char* fs_base = (char*) 0x200000;
     // NOTE: ATA LBA 17 is exactly where we put the FS in build_fs.py
@@ -314,28 +311,22 @@ void kern_main() {
     print("Done.\n");
     init_paging();
 
-    // 3. Parse Filesystem (Logic mostly same, just pointers changed)
     if (fs_base[0] != 'F' || fs_base[1] != 'S') {
         print("ERR: FS Magic Fail");
         while(1);
     }
-
 
     uint16 file_count = *(uint16*)(fs_base + 2);
     char* headers_start = fs_base + 4;
     char* data_start = headers_start + (file_count * sizeof(struct FileHeader));
     struct FileHeader* current_file = (struct FileHeader*) headers_start;
 
-
     register_hook(0x1F0000, secret_vault_device);
 
-    // 5. ENABLE INTERRUPTS (Cpu-wide)
     asm volatile("sti");
+
     for (int i = 0; i < file_count; i++) {
         if (strcmp(current_file->name, "app.bin") == 0) {
-
-            // 4. Relocate User App to 0x300000 (3MB Mark)
-            // Giving it 1MB of dedicated space (from 3MB to 4MB)
             char* file_content = data_start + current_file->offset;
             char* execution_location = (char*)0x20000;
 
@@ -343,7 +334,6 @@ void kern_main() {
 
             print("Running App at 0x20000...\n");
 
-            // 5. Execute
             FunctionPtr app_entry = (FunctionPtr)execution_location;
             app_entry();
             break;
